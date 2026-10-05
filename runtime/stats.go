@@ -13,6 +13,10 @@ type Stats struct {
 	Canceled  int64
 	Rejected  int64
 	Skipped   int64
+	// Panics 为被运行时收敛为失败终态的崩溃次数（同时计入 Failed）。
+	Panics int64
+	// AdmissionWaits 为因准入容量不足而发生过等待的提交批次数。
+	AdmissionWaits int64
 	// TotalDurationNanos 为所有已执行任务（含重试各次尝试）的累计耗时。
 	TotalDurationNanos int64
 }
@@ -30,6 +34,8 @@ type statsCounter struct {
 	canceled  atomic.Int64
 	rejected  atomic.Int64
 	skipped   atomic.Int64
+	panics    atomic.Int64
+	admWaits  atomic.Int64
 	totalDur  atomic.Int64
 }
 
@@ -42,6 +48,8 @@ func (c *statsCounter) snapshot() Stats {
 		Canceled:           c.canceled.Load(),
 		Rejected:           c.rejected.Load(),
 		Skipped:            c.skipped.Load(),
+		Panics:             c.panics.Load(),
+		AdmissionWaits:     c.admWaits.Load(),
 		TotalDurationNanos: c.totalDur.Load(),
 	}
 }

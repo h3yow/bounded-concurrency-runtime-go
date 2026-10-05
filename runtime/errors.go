@@ -21,6 +21,8 @@ const (
 	ReasonDependencyFailed
 	// ReasonInvalidDependency 依赖未知或成环，提交被拒绝。
 	ReasonInvalidDependency
+	// ReasonPanicked 任务执行体发生未捕获 panic，被运行时收敛为失败终态。
+	ReasonPanicked
 )
 
 func (r Reason) String() string {
@@ -35,6 +37,8 @@ func (r Reason) String() string {
 		return "dependency_failed"
 	case ReasonInvalidDependency:
 		return "invalid_dependency"
+	case ReasonPanicked:
+		return "panicked"
 	default:
 		return "unknown"
 	}

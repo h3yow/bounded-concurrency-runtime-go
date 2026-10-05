@@ -42,6 +42,16 @@ func WithFailurePolicy(p FailurePolicy) Option {
 	return func(r *Runtime) { r.policy = p }
 }
 
+// WithAdmissionTimeout 设置阻塞式 Submit 等待准入名额的最坏收敛时间上界，
+// 超时后整批拒绝并返回包装 ErrAdmissionTimeout 的错误。<=0 时回退默认值。
+func WithAdmissionTimeout(d time.Duration) Option {
+	return func(r *Runtime) {
+		if d > 0 {
+			r.admissionTimeout = d
+		}
+	}
+}
+
 // WithRetryPolicy 设置默认重试策略。
 func WithRetryPolicy(p RetryPolicy) Option {
 	return func(r *Runtime) { r.retry = p }
@@ -49,15 +59,18 @@ func WithRetryPolicy(p RetryPolicy) Option {
 
 // Runtime 是有界资源的进程内并发任务执行运行时。
 //
-// 背压模型：运行时持有 queueCap 个准入令牌，每个被接受的任务持有一枚，
-// 到达终态后归还。Submit 在令牌不足时阻塞等待（可被 ctx 取消），
-// TrySubmit 在令牌不足时立即拒绝。等待依赖的任务已计入准入，
+// 背压模型：运行时持有 queueCap 个准入名额，按批原子获取：一批任务要么
+// 整批被接受，要么整批被拒绝并告知原因，不存在只进一部分的中间态；
+// 等待期间不持有任何名额。Submit 在名额不足时有界等待（受
+// WithAdmissionTimeout 与 ctx 双重约束，最坏有限时间内收敛），
+// TrySubmit 在名额不足时立即整批拒绝。等待依赖的任务已计入准入，
 // 但不持有任何资源额度；额度仅在实际执行尝试期间持有。
 type Runtime struct {
-	quotas   *quotas
-	policy   FailurePolicy
-	retry    RetryPolicy
-	queueCap int
+	quotas           *quotas
+	policy           FailurePolicy
+	retry            RetryPolicy
+	queueCap         int
+	admissionTimeout time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -70,7 +83,7 @@ type Runtime struct {
 	pending    int // 未到达终态的任务数
 	done       chan struct{}
 
-	admission chan struct{} // 准入令牌，容量 queueCap
+	admission *admission
 	ready     chan *taskState
 	stop      chan struct{}
 	stopOnce  sync.Once
@@ -111,21 +124,22 @@ func (ts *taskState) ctx() context.Context {
 func New(opts ...Option) *Runtime {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runtime{
-		quotas:     newQuotas(nil),
-		policy:     Isolate,
-		retry:      RetryPolicy{MaxAttempts: 1},
-		queueCap:   1024,
-		ctx:        ctx,
-		cancel:     cancel,
-		tasks:      make(map[string]*taskState),
-		dependents: make(map[string][]*taskState),
-		done:       make(chan struct{}),
-		stop:       make(chan struct{}),
+		quotas:           newQuotas(nil),
+		policy:           Isolate,
+		retry:            RetryPolicy{MaxAttempts: 1},
+		queueCap:         1024,
+		admissionTimeout: DefaultAdmissionTimeout,
+		ctx:              ctx,
+		cancel:           cancel,
+		tasks:            make(map[string]*taskState),
+		dependents:       make(map[string][]*taskState),
+		done:             make(chan struct{}),
+		stop:             make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
-	r.admission = make(chan struct{}, r.queueCap)
+	r.admission = newAdmission(r.queueCap)
 	r.ready = make(chan *taskState, r.queueCap)
 	close(r.done) // 初始无任务，done 处于关闭态
 	r.wg.Add(1)
@@ -161,39 +175,27 @@ func (r *Runtime) submit(ctx context.Context, tasks []Task, tryOnly bool) error 
 	}
 	r.mu.Unlock()
 
-	// 准入：逐个获取令牌，失败时归还已获取部分。
-	acquired := 0
-	releaseAll := func() {
-		for i := 0; i < acquired; i++ {
-			<-r.admission
+	// 准入：整批原子获取名额——要么全部拿到，要么一个不占，
+	// 等待期间不持有任何名额，最坏在 admissionTimeout 内收敛。
+	waited, err := r.admission.acquire(ctx, len(tasks), r.admissionTimeout, tryOnly)
+	if err != nil {
+		r.stats.rejected.Add(int64(len(tasks)))
+		if waited {
+			r.stats.admWaits.Add(1)
 		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return &Error{Reason: ReasonCanceled, Cause: err}
+		}
+		return &Error{Reason: ReasonRejected, Cause: err}
 	}
-	for range tasks {
-		if tryOnly {
-			select {
-			case r.admission <- struct{}{}:
-				acquired++
-			default:
-				releaseAll()
-				r.stats.rejected.Add(int64(len(tasks)))
-				return &Error{Reason: ReasonRejected, Cause: ErrQueueFull}
-			}
-			continue
-		}
-		select {
-		case r.admission <- struct{}{}:
-			acquired++
-		case <-ctx.Done():
-			releaseAll()
-			r.stats.rejected.Add(int64(len(tasks)))
-			return &Error{Reason: ReasonCanceled, Cause: ctx.Err()}
-		}
+	if waited {
+		r.stats.admWaits.Add(1)
 	}
 
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		releaseAll()
+		r.admission.release(len(tasks))
 		r.stats.rejected.Add(int64(len(tasks)))
 		return &Error{Reason: ReasonRejected, Cause: ErrRuntimeClosed}
 	}
@@ -363,10 +365,17 @@ func (r *Runtime) run(ts *taskState) {
 			return
 		}
 		start := time.Now()
-		runErr := ts.task.Run(ctx)
+		runErr, panicErr := callIsolated(ctx, ts.task.Run)
 		totalDur += time.Since(start)
 		release()
 
+		if panicErr != nil {
+			// 崩溃被收敛为该任务一次可单独识别的失败终态，不重试，
+			// 失败传播（Isolate 跳过下游 / FailFast 收敛全部）与普通失败一致。
+			r.stats.panics.Add(1)
+			r.finish(ts, StatusFailed, &Error{Reason: ReasonPanicked, TaskID: ts.task.ID, Cause: panicErr}, totalDur, attempt)
+			return
+		}
 		if runErr == nil {
 			r.finish(ts, StatusCompleted, nil, totalDur, attempt)
 			return
@@ -396,9 +405,7 @@ func (r *Runtime) finish(ts *taskState, status Status, err error, dur time.Durat
 	r.mu.Lock()
 	released := r.finishLocked(ts, status, err, dur, attempts)
 	r.mu.Unlock()
-	for i := 0; i < released; i++ {
-		<-r.admission
-	}
+	r.admission.release(released)
 }
 
 // finishLocked 返回本次状态转换中新到达终态的任务数（调用方据此归还准入令牌）。
@@ -530,9 +537,7 @@ func (r *Runtime) Close() error {
 	r.mu.Lock()
 	released := r.cancelPendingLocked()
 	r.mu.Unlock()
-	for i := 0; i < released; i++ {
-		<-r.admission
-	}
+	r.admission.release(released)
 
 	r.mu.Lock()
 	done := r.done
