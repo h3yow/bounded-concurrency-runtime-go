@@ -47,6 +47,14 @@ func WithRetryPolicy(p RetryPolicy) Option {
 	return func(r *Runtime) { r.retry = p }
 }
 
+// WithSubmitTimeout 设置 Submit 等待准入令牌的最长时限。
+// 超时后整批拒绝（ErrAdmissionTimeout，ReasonRejected），已占令牌全部归还；
+// 调用方 ctx 取消仍然优先（ReasonCanceled）。<=0 表示仅受 ctx 约束。
+// TrySubmit 不受影响，始终立即判定。
+func WithSubmitTimeout(d time.Duration) Option {
+	return func(r *Runtime) { r.submitTimeout = d }
+}
+
 // Runtime 是有界资源的进程内并发任务执行运行时。
 //
 // 背压模型：运行时持有 queueCap 个准入令牌，每个被接受的任务持有一枚，
@@ -56,8 +64,9 @@ func WithRetryPolicy(p RetryPolicy) Option {
 type Runtime struct {
 	quotas   *quotas
 	policy   FailurePolicy
-	retry    RetryPolicy
-	queueCap int
+	retry         RetryPolicy
+	queueCap      int
+	submitTimeout time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -161,12 +170,19 @@ func (r *Runtime) submit(ctx context.Context, tasks []Task, tryOnly bool) error 
 	}
 	r.mu.Unlock()
 
-	// 准入：逐个获取令牌，失败时归还已获取部分。
+	// 准入：整批要么全部拿到令牌，要么全部归还并拒绝，绝不部分准入。
+	// 阻塞等待受调用方 ctx 与 WithSubmitTimeout 双重约束，保证有限时间收敛。
 	acquired := 0
 	releaseAll := func() {
 		for i := 0; i < acquired; i++ {
 			<-r.admission
 		}
+	}
+	actx := ctx
+	var cancelWait context.CancelFunc
+	if !tryOnly && r.submitTimeout > 0 {
+		actx, cancelWait = context.WithTimeout(ctx, r.submitTimeout)
+		defer cancelWait()
 	}
 	for range tasks {
 		if tryOnly {
@@ -183,10 +199,13 @@ func (r *Runtime) submit(ctx context.Context, tasks []Task, tryOnly bool) error 
 		select {
 		case r.admission <- struct{}{}:
 			acquired++
-		case <-ctx.Done():
+		case <-actx.Done():
 			releaseAll()
 			r.stats.rejected.Add(int64(len(tasks)))
-			return &Error{Reason: ReasonCanceled, Cause: ctx.Err()}
+			if ctx.Err() != nil {
+				return &Error{Reason: ReasonCanceled, Cause: ctx.Err()}
+			}
+			return &Error{Reason: ReasonRejected, Cause: ErrAdmissionTimeout}
 		}
 	}
 

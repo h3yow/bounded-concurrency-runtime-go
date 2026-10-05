@@ -89,6 +89,8 @@ func ReasonOf(err error) Reason {
 var (
 	// ErrQueueFull 在提交超过有界队列容量且不愿等待时返回。
 	ErrQueueFull = errors.New("runtime: queue full")
+	// ErrAdmissionTimeout 在 Submit 等待准入令牌超过 WithSubmitTimeout 时返回。
+	ErrAdmissionTimeout = errors.New("runtime: admission wait timeout")
 	// ErrRuntimeClosed 在运行时关闭后继续提交时返回。
 	ErrRuntimeClosed = errors.New("runtime: closed")
 )
