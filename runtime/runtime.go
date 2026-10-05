@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -86,6 +87,8 @@ type Runtime struct {
 	wg        sync.WaitGroup
 
 	stats statsCounter
+
+	admissionWaits atomic.Int64 // 累计发生准入等待的提交批次数
 }
 
 // taskState 是任务的内部调度状态。
@@ -184,6 +187,7 @@ func (r *Runtime) submit(ctx context.Context, tasks []Task, tryOnly bool) error 
 		actx, cancelWait = context.WithTimeout(ctx, r.submitTimeout)
 		defer cancelWait()
 	}
+	waited := false
 	for range tasks {
 		if tryOnly {
 			select {
@@ -195,6 +199,16 @@ func (r *Runtime) submit(ctx context.Context, tasks []Task, tryOnly bool) error 
 				return &Error{Reason: ReasonRejected, Cause: ErrQueueFull}
 			}
 			continue
+		}
+		select {
+		case r.admission <- struct{}{}:
+			acquired++
+			continue
+		default:
+		}
+		if !waited {
+			waited = true
+			r.admissionWaits.Add(1)
 		}
 		select {
 		case r.admission <- struct{}{}:
