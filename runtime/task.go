@@ -23,7 +23,7 @@ const (
 	StatusFailed
 	StatusCanceled
 	StatusRejected
-	StatusSkipped // 依赖失败导致未执行
+	StatusSkipped  // 依赖失败导致未执行
 	StatusPanicked // 执行体 panic，被运行时隔离收敛
 )
 

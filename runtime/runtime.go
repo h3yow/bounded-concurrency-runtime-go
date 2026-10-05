@@ -63,8 +63,8 @@ func WithSubmitTimeout(d time.Duration) Option {
 // TrySubmit 在令牌不足时立即拒绝。等待依赖的任务已计入准入，
 // 但不持有任何资源额度；额度仅在实际执行尝试期间持有。
 type Runtime struct {
-	quotas   *quotas
-	policy   FailurePolicy
+	quotas        *quotas
+	policy        FailurePolicy
 	retry         RetryPolicy
 	queueCap      int
 	submitTimeout time.Duration
