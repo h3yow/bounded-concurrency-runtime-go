@@ -21,6 +21,8 @@ const (
 	ReasonDependencyFailed
 	// ReasonInvalidDependency 依赖未知或成环，提交被拒绝。
 	ReasonInvalidDependency
+	// ReasonPanicked 任务执行体发生未被接住的 panic，被运行时隔离收敛。
+	ReasonPanicked
 )
 
 func (r Reason) String() string {
@@ -35,6 +37,8 @@ func (r Reason) String() string {
 		return "dependency_failed"
 	case ReasonInvalidDependency:
 		return "invalid_dependency"
+	case ReasonPanicked:
+		return "panicked"
 	default:
 		return "unknown"
 	}
@@ -71,6 +75,10 @@ func ReasonOf(err error) Reason {
 	var re *Error
 	if errors.As(err, &re) {
 		return re.Reason
+	}
+	var pe *PanicError
+	if errors.As(err, &pe) {
+		return ReasonPanicked
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return ReasonCanceled

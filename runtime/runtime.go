@@ -363,7 +363,7 @@ func (r *Runtime) run(ts *taskState) {
 			return
 		}
 		start := time.Now()
-		runErr := ts.task.Run(ctx)
+		runErr := runProtected(ts.task.ID, ts.task.Run, ctx)
 		totalDur += time.Since(start)
 		release()
 
@@ -373,6 +373,12 @@ func (r *Runtime) run(ts *taskState) {
 		}
 		if ReasonOf(runErr) == ReasonCanceled {
 			r.finish(ts, StatusCanceled, &Error{Reason: ReasonCanceled, TaskID: ts.task.ID, Cause: runErr}, totalDur, attempt)
+			return
+		}
+		// panic 已被 runProtected 收敛：作为独立终态记录，不重试，
+		// 失败策略传播（Isolate 跳过下游 / FailFast 收敛）在 finishLocked 中处理。
+		if ReasonOf(runErr) == ReasonPanicked {
+			r.finish(ts, StatusPanicked, &Error{Reason: ReasonPanicked, TaskID: ts.task.ID, Cause: runErr}, totalDur, attempt)
 			return
 		}
 		taskErr := &Error{Reason: ReasonTaskFailed, TaskID: ts.task.ID, Cause: runErr}
@@ -426,6 +432,15 @@ func (r *Runtime) finishLocked(ts *taskState, status Status, err error, dur time
 		}
 	case StatusFailed:
 		r.stats.failed.Add(1)
+		r.stats.totalDur.Add(dur.Nanoseconds())
+		released += r.skipDependentsLocked(ts.task.ID)
+		if r.policy == FailFast {
+			r.cancel()
+			released += r.cancelPendingLocked()
+		}
+	case StatusPanicked:
+		// 与 Failed 相同的策略传播，但计入独立口径。
+		r.stats.panicked.Add(1)
 		r.stats.totalDur.Add(dur.Nanoseconds())
 		released += r.skipDependentsLocked(ts.task.ID)
 		if r.policy == FailFast {
@@ -549,7 +564,7 @@ func (r *Runtime) Stats() Stats { return r.stats.snapshot() }
 
 func terminal(s Status) bool {
 	switch s {
-	case StatusCompleted, StatusFailed, StatusCanceled, StatusRejected, StatusSkipped:
+	case StatusCompleted, StatusFailed, StatusCanceled, StatusRejected, StatusSkipped, StatusPanicked:
 		return true
 	}
 	return false
